@@ -28,7 +28,7 @@ use larkstack_core::{LarkRegistry, default_base_url};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use tracing::warn;
+use tracing::{info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::HostState;
@@ -333,7 +333,11 @@ pub async fn callback(
     };
 
     let emails = user.emails();
-    if !cfg.admins.is_empty() && !emails.iter().any(|e| cfg.admins.contains(e)) {
+    let open_id_ok = user
+        .open_id
+        .as_deref()
+        .is_some_and(|id| cfg.admins.iter().any(|a| a == id));
+    if !cfg.admins.is_empty() && !open_id_ok && !emails.iter().any(|e| cfg.admins.contains(e)) {
         if emails.is_empty() {
             warn!(
                 "denied console login: Lark returned no email for this account. Grant the app \
@@ -342,6 +346,9 @@ pub async fn callback(
             );
         } else {
             warn!("denied console login for {emails:?} — not in [console].admins");
+        }
+        if let Some(id) = user.open_id.as_deref() {
+            warn!("denied account open_id={id} (usable in [console].admins)");
         }
         return (
             jar,
@@ -475,6 +482,10 @@ async fn exchange_code(
         .map_err(|e| e.to_string())?;
     let status = resp.status();
     let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    info!(
+        "oauth token granted scope: {:?}",
+        v.get("scope").and_then(|s| s.as_str())
+    );
     v.get("access_token")
         .and_then(|t| t.as_str())
         .map(str::to_string)
@@ -523,7 +534,19 @@ async fn fetch_user(
         .await
         .map_err(|e| e.to_string())?;
     let status = resp.status();
-    let parsed: UserInfoResp = resp.json().await.map_err(|e| e.to_string())?;
+    let raw: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    // Field names only (plus code/msg) — values are personal data.
+    info!(
+        "oauth user_info code={:?} msg={:?} fields={:?}",
+        raw.get("code"),
+        raw.get("msg"),
+        raw.get("data").and_then(|d| d.as_object()).map(|o| o
+            .iter()
+            .filter(|(_, v)| !v.is_null() && v.as_str() != Some(""))
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>())
+    );
+    let parsed: UserInfoResp = serde_json::from_value(raw).map_err(|e| e.to_string())?;
     parsed
         .data
         .ok_or_else(|| format!("no user data (status={status})"))
